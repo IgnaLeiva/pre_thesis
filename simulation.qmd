@@ -1,0 +1,758 @@
+---
+title: "Weighting method"
+format: html
+editor: visual
+---
+
+```{r }
+#| echo: false
+#| warning: false
+
+
+library("tidyverse")
+library("haven")
+library("survival")
+library("future") # parallel processing
+library("future.apply") # parallel processing
+library(gtsummary)
+
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+
+```
+
+## Aim
+
+To conduct a IPW method for transporting the PRIME study: An earlier pivotal phase III study of panitumumab as monotherapy in the mCRC setting provided evidence that clinical benefit was specific to patients with wild-type (WT) KRAS tumors.Running Code
+
+## Trial population
+
+```{r}
+# SAS data base has labels. Example to seee it
+
+# label_lookup <- tibble(
+#   col_name = read_sas("trialdata/adsl_pds2019.sas7bdat") %>% names(),
+#   labels = read_sas("trialdata/adsl_pds2019.sas7bdat") %>% map_chr(attr_getter("label"))
+# )
+
+
+
+trial <- read_sas("data/trial.sas7bdat") %>%
+  merge(read_sas("data/biomark_trial.sas7bdat"), by = "SUBJID") |> 
+  rename_all(.funs = list(tolower)) |>  #lower case for name of columns
+    mutate(
+      
+    intrial = 1, 
+    wildkras = case_when( 
+      tolower(bmmtr1) %in% c("", "failure") ~ as.numeric(NA),
+      tolower(bmmtr1) == "wild-type" ~ 1,
+      TRUE ~ 0
+    ),
+    treatment = case_when( 
+      tolower(trt) == "folfox alone" ~ 0,
+      TRUE ~ 1
+    ),
+    colon = case_when( 
+      diagtype == "Colon" ~ 1,
+      TRUE ~ 0
+    ),
+    female = case_when(
+      sex == "Female" ~ 1,
+      TRUE ~ 0
+    ),
+    livermets = case_when( 
+      tolower(livermet) == "y" ~ 1,
+      TRUE ~ 0)
+    ) |> 
+  select("intrial", # belongs to the trial
+         "treatment", # Treatment 
+         "wildkras",  # Gen
+         "female",    # Primary toumor diagnosis
+         "colon",     # Primary toumor diagnosis
+         "livermets", # liver metastasis to the study entry
+         "age",
+         "pfsdycr",   # PFS Day (Central, RECIST)
+         "pfscr"      # PD on study (Central, RECIST) or Death
+         ) |> 
+  filter_all(complete.cases)
+```
+
+### Characteristics
+
+Table with the RCT patient characteristics
+
+```{r}
+trial %>%
+  tbl_summary()
+
+trial %>%
+  tbl_summary(by = treatment) %>%
+  add_difference(everything() ~ "smd")
+
+trial |> ggplot(aes(x=age)) + geom_histogram(bins = 10) + theme_bw()
+```
+
+### Regression
+
+Cox regression no adjusted
+
+```{r}
+uwfit_unadjusted <- coxph(Surv(pfsdycr, pfscr) ~ treatment,
+               data =  trial #filter(trial, intrial == 1)
+)
+broom::tidy(uwfit_unadjusted, exponentiate = T, conf.int = T)
+
+uwfit_adjusted <- coxph(Surv(pfsdycr, pfscr) ~ treatment + wildkras + female +
+                          colon + livermets + age , data =  trial)
+
+broom::tidy(uwfit_adjusted, exponentiate = T, conf.int = T)
+```
+
+## Target population
+
+```{r}
+target <- read_sas("data/target_population.sas7bdat") %>%
+  rename_all(.funs = list(tolower)) %>%
+  mutate(
+    intrial = 0
+  ) %>%
+  select("intrial", "wildkras", "female", "colon", "livermets", "age") %>%
+  filter_all(complete.cases) 
+
+
+target %>%
+  tbl_summary() 
+```
+
+## Step to get the results
+
+Write the helper functions (.)
+
+1.  Join data: function for this
+
+```{r}
+
+.joindata <- function(trialdata,       # The name of the trial data set
+                      targetdata      # The name of the target data set
+) {
+  # remove sas labels
+  for (v in names(trialdata)) {
+    attr(trialdata[[deparse(as.name(v))]], "label") <- NULL
+  }
+  for (v in names(targetdata)) {
+    attr(targetdata[[deparse(as.name(v))]], "label") <- NULL
+  }
+  suppressMessages(full_join(trialdata, targetdata))
+}
+
+
+```
+
+2.  Calculate inverse odds weights using logitic regression model. This is include in the below fuction
+
+```{r}
+# This function calculates inverse odds weights based on a logistic model
+# that estimates the "pseudo-probability" of target membership given a
+# linear parameterization with possible indicator functions for categorical
+# variables
+
+.calcwts <- function(concat,           # (name) The name of the trial + target concatenated data set
+                     modelparams = NULL # (character vector) All the variables to be used in the model
+) {
+  # build model formula in R syntax
+  outcome <- "intrial"
+  f_den_str <- paste0(outcome, " ~ ", paste(c("1", modelparams), collapse = " + "))
+ 
+   #To obtain the numerator of stabilized odds weights, we have to run additional regressions
+  
+  # with an empty set of variables (intercept only model)
+  f_num_str <- paste0(outcome, " ~ 1")
+  f_den <- as.formula(f_den_str) # denominator
+  f_num <- as.formula(f_num_str) # numerator
+  
+  # fit model
+  m_den <- glm(formula = f_den, data = concat, family = binomial())
+  m_num <- glm(formula = f_num, data = concat, family = binomial())
+  
+  # get predicted probabilities
+  p_den <- predict(m_den, type = "response", newdata = concat)
+  p_num <- predict(m_num, type = "response", newdata = concat)
+  
+  # calculate stabilized weights
+  # Now, we simply calculate stabilized / unstabilized inverse odds weights
+  message(paste0("Numerator model: ", f_num_str))
+  message(paste0("Denominator model: ", f_den_str))
+  mutate(.data = concat,
+         denomodds = p_den / (1 - p_den),
+         numodds = p_num / (1 - p_num),
+         ioperating_systemw = intrial * 1 / denomodds,
+         sioperating_systemw = intrial * numodds / denomodds # stabilised
+  )
+}
+
+
+
+```
+
+3.  The weight function
+
+    there is a chance to calculate the weight for each arm, then obtain the weight, then the new population are mixed
+
+```{r}
+
+getweights <- function(trialdata,       # (name) The name of the trial data set
+                       targetdata,      # (name) The name of the target data set
+                       modelparams = NULL, # (character vector) All the variables to be used in the model
+                       weightbyarm = TRUE
+) {
+  # create joint dataset
+  # IF weightbyarm is TRUE we need to split the trial data into two groups,
+  # one for each arm, then combine each of them with the target data
+  
+  if (weightbyarm) {
+# if(TREU/FALSE)
+    message("Fit weights separately by trial arm")
+    # sequence for numbering rows of the trial data
+    trialdata$order <- seq_len(nrow(trialdata))
+      
+    concat1 <- .joindata(filter(trialdata, treatment == 1), targetdata) # .joindata is a fuction to join data. This code only select intervencion arm
+          # Calculate weights
+    ret1 <- .calcwts(concat1, modelparams)
+    
+    concat0 <- .joindata(filter(trialdata, treatment == 0), targetdata)
+    ret0 <- suppressMessages(.calcwts(concat0, modelparams))
+    
+    # Next, we combine the data sets;
+    ret <- rbind(filter(ret1, intrial == 1), ret0)
+    ret <- ret[order(ret$order), ]
+    
+  } else {
+    
+    #If weightbyarm is FALSE, we instead simply concatenate the trial and target populations,
+    # then run similar logistic regressions
+    message("Fit weights using entire trial population in a single model")
+    concat <- .joindata(trialdata, targetdata)
+    ret <- .calcwts(concat, modelparams)
+  }
+  return(ret)
+}
+```
+
+4.  Bootstrapping
+
+```{r}
+
+npbootstrap <- function(iters = 5,
+                        trialdata = trialset, 
+                        targetdata = targset, ..., verbose = TRUE) {
+  
+  outset <- getweights(trialdata = trialdata, targetdata = targetdata, ...)
+  
+  wfit <- coxph(Surv(pfsdycr, pfscr) ~ treatment,
+                data = filter(outset, intrial == 1),
+                weights = sioperating_systemw)
+  
+  ocoef <- coef(summary(wfit))[, c("coef", "robust se")]
+  message(paste("Bootstrapping", iters, "iterations"))
+  
+  # single bootstrap iteration helper function
+  .bootiter <- function(i, trialdata = NULL, targetdata = NULL, ..., 
+                        verbose = TRUE) {
+    if (verbose) cat(".") # progress bar won't work in parallel processing
+    ntrial <- nrow(trialdata)
+    ntarg <- nrow(targetdata)
+    trialidx <- sample(seq_len(ntrial), ntrial, replace = TRUE)
+    targidx <- sample(seq_len(ntarg), ntarg, replace = TRUE)
+    suppressMessages(outset <- getweights(trialdata = trialdata[trialidx, ], targetdata = targetdata[targidx, ], ...))
+    
+    wfit <- coxph(Surv(pfsdycr, pfscr) ~ treatment,
+                  data = filter(outset, intrial == 1),
+                  weights = sioperating_systemw)
+    
+    res <- coef(summary(wfit))[, c("coef", "robust se")]
+    as.numeric(res)
+  }
+  
+  boots <- future.apply::future_lapply(seq_len(iters), .bootiter, trialdata = trialdata,
+                                       targetdata = targetdata, ..., verbose = verbose,
+                                       future.seed = 56789)
+  if (verbose) cat("\n")
+  res <- list()
+  rr <- do.call("rbind", boots)
+  colnames(rr) <- c("coef", "robust se")
+  res[["boots"]] <- as.data.frame(rr)
+  res[["original"]] <- as.data.frame(ocoef)
+  class(res) <- "transboot"
+  res
+}
+
+print.transboot <- function(x, ...) {
+  # this just formats how npbootstrap results are shown in output
+  # it takes advantage of the "print" generic R function
+  oest <- x$original
+  best <- x$boots
+  # print out original estimate
+  cat("Estimate:\n   ")
+  est <- oest[1]
+  cat(est[1, 1])
+  cat("\n")
+  cat("Robust standard error:\n   ")
+  cat(oest[2, 1])
+  cat("\n")
+  # bootstrap standard error
+  cat("Bootstrap standard error:\n   ")
+  booterr <- sd(best[, 1])
+  cat(booterr)
+  cat("\n")
+  cat("Bootstrap Wald 95% CI:\n   ")
+  cat(est[1, 1] + qnorm(c(.025, .975)) * booterr)
+  cat("\n")
+}
+```
+
+# Data analysis
+
+```{r}
+# Now, we want to obtain weights so that the trial resembles the target using the "getweights" function from above
+
+outset <- getweights(trialdata = trial, targetdata = target,
+                     modelparams = c("age", "female", "colon", "livermets", "wildkras"),
+                     weightbyarm = TRUE) # set to true to get the weight in each arm, then join the dataset
+```
+
+```{r}
+#Now that we have weights, we can use them in a weighted analysis to estimate a hazard ratio for the effect of treatment
+wfit <- coxph(Surv(pfsdycr, pfscr) ~ treatment,
+              data = filter(outset, intrial == 1), # study participant
+              weights = sioperating_systemw)
+summary(wfit)
+
+
+uwfit <- coxph(Surv(pfsdycr, pfscr) ~ treatment,
+               data = filter(outset, intrial == 1)
+)
+summary(uwfit)
+```
+
+Bootstrapping
+
+```{r}
+
+# compare weighted results with non-parametric bootstrap results
+# this will take a while to do 250 iterations (set to 5 by default in case you run it by accident)!
+# set up parallel processing using all available cores (takes a few seconds)
+future::plan(multisession)
+rr <- npbootstrap(iter = 5, trialdata = trial, targetdata = target,
+                  modelparams = c("age", "female", "colon", "livermets", "wildkras"),
+                  weightbyarm = TRUE, verbose = TRUE)
+rr
+
+# you can access the individual bootstrap iterations to get percentile based CI
+#  (but not really advisable unless you have 1000+ bootstrap iterations)
+exp(quantile(rr$boots$coef, probs = c(.025, 0.975)))
+```
+
+# Visualisation
+
+## Density plot
+
+### Helper functions
+
+```{r}
+
+# .joindata ; but it already existes
+
+
+# This function calculates inverse odds weights based on a logistic model
+# that estimates the "pseudo-probability" of target membership given a
+# linear parameterization with possible indicator functions for categorical
+# variables
+.calcprobs <- function(concat,           # (name) The name of the trial + target concatenated data set
+                       modelparams = NULL # (character vector) All the variables to be used in the model
+) {
+  # build model formula in R syntax
+  outcome <- "intrial"
+  f_samp_str <- paste0(outcome, " ~ ", paste(c("1", modelparams), collapse = " + "))
+  f_samp <- as.formula(f_samp_str)
+  
+  # fit model
+  m_samp <- glm(formula = f_samp, data = concat, family = binomial())
+  
+  # get predicted probabilities
+  concat$sampprob <- predict(m_samp, type = "response", newdata = concat)
+  message(paste0("Sampling model: ", f_samp_str))
+  mutate(.data = concat,
+         trialprobs = case_when(
+           intrial == 1 ~ sampprob,
+           TRUE ~ as.numeric(NA)
+         ),
+         targprobs = case_when(
+           intrial == 0 ~ sampprob,
+           TRUE ~ as.numeric(NA)
+         )
+  )
+}
+
+```
+
+#### the function plot
+
+```{r}
+
+# Code for density probabilities
+
+dens_plot <- function(trialdata,       # (name) Name of trial / study population file
+                      targetdata,      # (name) Name of target population file
+                      catparams = NULL, # (character vector) Set of variables to be plotted in the figure - should be binary
+                      modelparams = NULL, # (character vector) Set of variables to be plotted in the figure - should be continuous
+                      figurename = NULL      # (not used in R) The name of the output data set that includes weights
+) {
+  concat <- .joindata(trialdata, targetdata)
+  res <- .calcprobs(concat, modelparams)
+  p <- ggplot() + theme_classic() +
+    scale_fill_discrete(name = "") +
+    scale_x_continuous(name = "Predicted probability of presence in the trial data") +
+    scale_y_continuous(name = "Percent")
+  p <- p +
+    # stat count will count the number of observation (at that y value) then divide by the total sample
+    geom_histogram(aes(x = trialprobs, fill = "Trial", y = 100 * stat(count) / sum(count)), alpha = 0.5,
+                   data = filter(res, intrial == 1 & !is.na(trialprobs)), binwidth = 0.005, color = "black", size = 0.1) +
+    
+    geom_histogram(aes(x = targprobs, fill = "Target", y = 100 * stat(count) / sum(count)), alpha = 0.5,
+                   data = filter(res, intrial == 0), binwidth = 0.005, color = "black", size = 0.1)
+  p[["data"]] <- res
+  p
+}
+
+
+```
+
+#### The plot
+
+```{r}
+# create plot using the dens_plot function
+p <- dens_plot(trialdata = trial,
+               targetdata = target,
+               modelparams = c("age", "female", "colon", "livermets", "wildkras"),
+               figurename = NULL
+)
+# additional cleanup of the plot
+p <- p + coord_cartesian(xlim = c(0, .20)) # note this is extensible with ggplot2 functions
+p
+#ggsave(filename = paste0(figdir, "Density_plot.png"), plot = p, width = unit(5, "in"), height = unit(3.5, "in"))
+
+
+
+```
+
+## Love plot
+
+### Helper functions
+
+```{r}
+
+# figure out whether a variable is binary or not
+.is_this_binary <- function(v) {
+  length(unique(v)) == 2
+}
+
+# calculate the pooled standard deviation
+.sd_pooled <- function(v, intrial, isbinary = FALSE) {
+  # following https: /  / www.ncbi.nlm.nih.gov / pmc / articles / PMC3472075 /
+  # this applies equal weight to target and trial data (but not equal weight to all observations)
+  # (not the only way to calculate a pooled SD)
+  if (!isbinary) {
+    var1 <- var(v[which(intrial == 1)], na.rm = TRUE)
+    var0 <- var(v[which(intrial == 0)], na.rm = TRUE)
+  }
+  if (isbinary) {
+    p1 <- mean(v[which(intrial == 1)], na.rm = TRUE)
+    p0 <- mean(v[which(intrial == 0)], na.rm = TRUE)
+    var1 <- p1 * (1 - p1)
+    var0 <- p0 * (1 - p0)
+    # FLAG
+  }
+  sqrt((var1 + var0) / 2)
+}
+
+# calculate standardized mean difference for a single variable
+.get_smd <- function(v, intrial, isbinary = FALSE) {
+  
+  # warn if there are missing data (ideally we use analytic, complete - case data here)
+  set_warning <- any(is.na(v))
+  
+  # 1. calculate mean of each variable
+  meandiff <- mean(v[which(intrial == 1)], na.rm = TRUE) - mean(v[which(intrial == 0)], na.rm = TRUE)
+  
+  # 2. calculate the mean difference
+  pooledsd <- .sd_pooled(v, intrial, isbinary) # equal weight to all data sets
+  
+  # 3. divide the difference by pooled standard deviation
+  r <- c(smd = meandiff / pooledsd, meandiff = meandiff, poolesd = pooledsd)
+  attr(r, which = "anymissing") <- set_warning
+  r
+}
+
+
+# calculate standardized mean difference for all variables
+.calculate_smds <- function(trialdata, # Name of trial / study population file
+                            targetdata, # Name of target population file
+                            variables # names of variables used in loveplot (binary or continuous assumed)
+) {
+  trialdata$intrial <- 1
+  targetdata$intrial <- 0
+  
+  # combine datasets
+  concat <- .joindata(trialdata, targetdata)
+  
+  # get standardized mean differenc for each variable
+  smdsl <- lapply(variables, function(x) .get_smd(concat[[x]], # concat is the join data
+                                                  concat$intrial, 
+                                                  .is_this_binary(concat[[x]])))
+  smds <- data.frame(do.call(rbind, smdsl))
+  anymissing <- do.call(c, lapply(smdsl, function(x) attr(x, "anymissing")))
+  if (any(anymissing)) {
+    warning(paste("Missing / NA values (ignored in computations) detected in:", paste(variables[which(anymissing)], collapse = ", ")))
+  }
+  smds
+}
+
+```
+
+#### the function plot
+
+```{r}
+# Main plotting function: most of the calculations are done in the helper function .calculate_smds
+love_plot <- function(trialdata, # Name of trial / study population file
+                      targetdata, # Name of target population file
+                      variables, # names of variables used in loveplot (binary or continuous assumed)
+                      nicenames = NULL # Names of variables to be printed on plot
+) {
+  if (is.null(nicenames)) nicenames <- variables
+  smds <- .calculate_smds(trialdata, targetdata, variables)
+  plotdata <- cbind(smds, data.frame(variable = variables, nicenames = nicenames))
+  plotdata
+  p <- ggplot(data = plotdata) + theme_classic() +
+    geom_vline(aes(xintercept = c(0.0))) +
+    geom_vline(aes(xintercept = c(-.1)), linetype = "dashed", color = "gray50") +
+    geom_vline(aes(xintercept = c(.1)), linetype = "dashed", color = "gray50") +
+    geom_point(aes(x = smd, y = variable)) +
+    scale_y_discrete(name = "Covariate", labels = plotdata$nicenames, limits = plotdata$variable) +
+    scale_x_continuous(name = "Standardized Mean Difference")
+  p[["data"]] <- plotdata
+  p
+}
+```
+
+#### The plot
+
+```{r}
+love_plot <- love_plot(trialdata = trial,
+               targetdata = target,
+               variables = c("age", "livermets", "wildkras", "female", "colon"),
+               nicenames = c("Age (in years)", "Liver metastases", "Wild - type KRAS", "Female sex", "Colon cancer")
+)
+# additional cleanup of the plot
+love_plot <- love_plot + coord_cartesian(xlim = c(-.75, .75)) # note this is extensible with ggplot2 functions
+love_plot
+#ggsave(filename = paste0(figdir, "Love_plot.png"), plot = love_plot, width = unit(5, "in"), height = unit(3.5, "in"))
+```
+
+## Skyscraper
+
+### Helper functions
+
+```{r}
+# cumulative sum, excluding missing values
+.nomisscumsum <- function(variable) {
+  tvar <- variable
+  tvar[is.na(variable)] <- 0
+  cumsum(tvar)
+}
+
+
+```
+
+#### the function plot
+
+```{r}
+
+# Main plotting function: most of the calculations are done in the helper function .getweights
+skyscraper_plot <- function(trialdata,       # (name) Name of trial / study population file
+                            targetdata,      # (name) Name of target population file
+                            modelparams = NULL, # (character vector) Set of variables to be plotted in the figure - should be continuous
+                            figurename = NULL      # (not used in R) The name of the output data set that includes weights
+) {
+  withweights <- getweights(trialdata, targetdata,
+                             modelparams = c("age", "female", "colon", "livermets", "wildkras"),
+                             weightbyarm = FALSE)
+  
+  if (any(is.na(withweights$sioperating_systemw ))) warning("Some weights are missing, plotting function excludes these")
+  withweights$forscramble <- runif(nrow(withweights))
+  plotdata <- data.frame(index = seq_len(nrow(withweights)), sioperating_systemw  = withweights$sioperating_systemw[order(withweights$forscramble)]) %>%
+    filter(!is.na(sioperating_systemw ) & sioperating_systemw  > 0)
+  plotdata$place <- .nomisscumsum(plotdata$sioperating_systemw ) # cumulative sum excluding missing values
+  p <- ggplot(data = plotdata) + theme_classic() +
+    scale_fill_discrete(name = "") +
+    scale_x_continuous(name = "Cumulative sum of weights") +
+    scale_y_continuous(name = "Stabilized weights")
+  p +
+    geom_line(aes(x = place, y = sioperating_systemw ), size = .2)
+}
+
+```
+
+#### The plot
+
+```{r}
+# the skyscraper plot randomly sorts the dataset, so set a seed for reproducibility
+set.seed(124)
+# create plot using the skyscraper_plot function
+sky <- skyscraper_plot(trial, target,
+                     modelparams = c("age", "female", "colon", "livermets", "wildkras")
+)
+
+# additional cleanup of the plot
+sky <- sky + coord_cartesian(ylim = c(0, 20)) + geom_hline(aes(yintercept = 10), size = .1) # note this is extensible with ggplot2 functions
+sky
+#ggsave(filename = paste0(figdir, "Skyscraper.png"), plot = sky, width = unit(4, "in"), height = unit(3.5, "in"))
+
+```
+
+## VITT plot
+
+### Helper functions
+
+```{r}
+# join data, alreay exist
+
+.lnor_vs_lnor_onesample <- function(trialdata,       # (name) Name of trial / study population file
+                                    targetdata,      # (name) Name of target population file
+                                    treatmentinoutcome = TRUE, # (logical scalar) TRUE Specify whether treatment will be included in the outcome model or not - may want to examine both
+                                    modelparams = NULL    # (character vector) Set of variables to be plotted in the figure - should be continuous or binary
+) {
+  # selection regression
+  outcome <- "intrial"
+  concat <- .joindata(trialdata, targetdata)
+  # build model formulas in R syntax
+  f_sel_str <- paste0(outcome, " ~ ", paste(c("1", modelparams), collapse = " + "))
+  f_sel <- as.formula(f_sel_str)
+  m_sel <- glm(formula = f_sel, data = concat, family = binomial())
+  #
+  # outcome regression
+  outcome <- "outcome"
+  if (treatmentinoutcome) modelparams <- c(modelparams, "treatment")
+  # build model formulas in R syntax
+  f_out_str <- paste0(outcome, " ~ ", paste(c("1", modelparams), collapse = " + "))
+  f_out <- as.formula(f_out_str)
+  m_out <- glm(formula = f_out, data = trialdata, family = binomial())
+  #
+  # output
+  ff <- c(coef(m_out)[-1], coef(m_sel)[-1])
+  names(ff) <- c(paste0("out_", names(coef(m_out)[-1])), paste0("sel_", names(coef(m_sel)[-1])))
+  ff
+}
+```
+
+#### the function plot
+
+```{r}
+# Main plotting function: most of the calculations are done in the helper function .lnor_vs_lnor_onesample
+# Main plotting function: most of the calculations are done in the helper function .lnor_vs_lnor_onesample
+vitt_plot <- function(trialdata,       # (name) Name of trial / study population file
+                      targetdata,      # (name) Name of target population file
+                      modelparams = NULL, # (character vector) Set of variables to be plotted in the figure - should be continuous
+                      treatmentinoutcome = TRUE, # (logical scalar) TRUE Specify whether treatment will be included in the outcome model or not - may want to examine both
+                      nicenames = NULL      # (character vector or NULL) Names for figure legend (equal to number of binary + continuous covariates + #levels of categorical variables - 1)
+) {
+  # vitt_plot
+  # This function works a little differently from the SAS version
+  
+  ## First, replicate the trial and target data 500 times to get a sense of uncertainty in estimates  ##
+  
+  ## Next, add back in the original trial and target data as replicate 0 ##
+  ## Then, use the trial data to estimate multivariable odds ratios between variables and the outcome ##
+  ## Next, we concatenate the study / trial and target data for estimating the sampling OR ##
+  lnor_original <- .lnor_vs_lnor_onesample(trialdata, targetdata, treatmentinoutcome, modelparams)
+  or_original <- exp(lnor_original)
+  ## And we run another logistic regression, this time on the intrial variable ##
+  B <- 500 # number of bootstrap samples
+  set.seed(1231)
+  seeds <- sample(seq_len(.Machine$integer.max), B + 1) # create random seed values, rather than sequential
+  trial_n <- nrow(trialdata)
+  target_n <- nrow(targetdata)
+  gen_ors <- function(i, .trial_n = trial_n, .target_n = target_n) {
+    set.seed(seeds[i])
+    # bootstrap sample
+    trial_boot <- trialdata[sample(seq_len(.trial_n), .trial_n, replace = TRUE), ]
+    target_boot <- targetdata[sample(seq_len(.target_n), .target_n, replace = TRUE), ]
+    # get log - odds ratios
+    lnors <- .lnor_vs_lnor_onesample(trial_boot, target_boot, treatmentinoutcome, modelparams)
+    ors <- exp(lnors)
+    ors
+  }
+  # repeat for total number of bootstrap samples, using parallel processing
+  # # note that this will run if run interactively (e.g. in Rstudio) but would
+  reslist <- future.apply::future_lapply(seq_len(B), gen_ors, .trial_n = trial_n, .target_n = target_n, future.seed = seeds[B + 1])
+  res <- data.frame(do.call("rbind", reslist))
+  res2 <- data.frame(rbind(or_original, res)) # include original results
+  vars <- gsub("sel_", "", grep("sel_", names(res), value = TRUE))
+  vals <- gsub("\\.", " = ", gsub("factor\\.", "", vars))
+  if (!is.null(nicenames)) {
+    if (length(nicenames) !=  length(vals)) stop(paste0("nicenames is the wrong length (should have ", length(vals), " values)"))
+    vals <- nicenames
+  }
+  print(vals)
+  print(vars)
+  p <- ggplot() + theme_classic() +
+    scale_color_manual(name = "", breaks = waiver(), labels = vals, limits = vars, values = 1:10) +
+    scale_shape_manual(name = "", breaks = c("Bootstrap draw", "Estimate"), values = c(20, 18)) +
+    scale_fill_manual(name = "", breaks = waiver(), labels = vals, limits = vars, values = 1:10) +
+    scale_y_log10(name = "Outcome odds ratios") +
+    scale_x_log10(name = "'Sampling' odds ratios")
+  for (v in vars) {
+    p <- p + geom_point(aes_(x = as.name(paste0("sel_", v)), y = as.name(paste0("out_", v)), fill = v, color = v, shape = "Bootstrap draw"), stroke = 0, alpha = 0.25, data = res)
+  }
+  for (v in vars) {
+    p <- p + geom_point(aes_(x = as.name(paste0("sel_", v)), y = as.name(paste0("out_", v)), shape = "Estimate"),
+                        data = res2[1, , drop = FALSE], color = "black")
+  }
+  p <- p + geom_hline(aes(yintercept = 1), size = .3) + geom_vline(aes(xintercept = 1), size = .3)
+  p[["data"]] <- res2
+  p
+}
+```
+
+```{r}
+#### 3. Analyses ####
+# First, let's import the trial and target data
+
+# create local copies
+trialset <- trial %>%
+  mutate(
+    outcome = case_when(
+      pfsdycr >=  365 ~ 0,
+      pfscr == 1 ~ 1,
+      TRUE ~ as.numeric(NA)
+    ),
+    age = age / 20
+  )
+targset  <- target %>%
+  mutate(
+    age = age / 20
+  )
+
+
+# set up parallel processing using all available cores (takes a few seconds)
+future::plan(multisession)
+# create plot using the vitt_plot function
+vitt <- vitt_plot(trialdata = trialset,
+               targetdata = targset,
+               modelparams = c("age", "female", "colon", "livermets", "wildkras"),
+               treatmentinoutcome = TRUE,
+               nicenames = c("Age / 20", "Female sex", "Colon cancer", "Liver Metastases", "Wild - type - KRAS")
+)
+# additional cleanup of the plot
+vitt <- vitt + coord_fixed(xlim = c(0.1, 10), ylim = c(0.1, 10), ratio = 1) # note this is extensible with ggplot2 functions
+vitt
+#ggsave(filename = paste0(figdir, "VITT_plot.png"), plot = vitt, width = unit(6, "in"), height = unit(3.5, "in"))
+```
